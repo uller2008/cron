@@ -52,6 +52,10 @@ type Entry struct {
 	// snapshot or remove it.
 	ID EntryID
 
+	// Mode determine whether the task is executed serially or in parallel
+	// true serially false parallel.
+	Mode bool
+
 	// Schedule on which this job should be run.
 	Schedule Schedule
 
@@ -212,14 +216,18 @@ func (c *Cron) Remove(id EntryID) {
 }
 
 // Start the cron scheduler in its own goroutine, or no-op if already started.
-func (c *Cron) Start() {
+func (c *Cron) Start(mode ...bool) {
+	runMode := false
+	if len(mode) > 0{
+		runMode = true
+	}
 	c.runningMu.Lock()
 	defer c.runningMu.Unlock()
 	if c.running {
 		return
 	}
 	c.running = true
-	go c.run()
+	go c.run(runMode)
 }
 
 // Run the cron scheduler, or no-op if already running.
@@ -236,12 +244,13 @@ func (c *Cron) Run() {
 
 // run the scheduler.. this is private just due to the need to synchronize
 // access to the 'running' state variable.
-func (c *Cron) run() {
+func (c *Cron) run(mode bool) {
 	c.logger.Info("start")
 
 	// Figure out the next activation times for each entry.
 	now := c.now()
 	for _, entry := range c.entries {
+		entry.Mode = mode
 		entry.Next = entry.Schedule.Next(now)
 		c.logger.Info("schedule", "now", now, "entry", entry.ID, "next", entry.Next)
 	}
@@ -270,9 +279,11 @@ func (c *Cron) run() {
 					if e.Next.After(now) || e.Next.IsZero() {
 						break
 					}
-					c.startJob(e.WrappedJob)
-					e.Prev = e.Next
-					e.Next = e.Schedule.Next(now)
+					c.startJob(*e,now)
+					if e.Mode == false{
+						e.Prev = e.Next
+						e.Next = e.Schedule.Next(now)
+					}
 					c.logger.Info("run", "now", now, "entry", e.ID, "next", e.Next)
 				}
 
@@ -305,11 +316,17 @@ func (c *Cron) run() {
 }
 
 // startJob runs the given job in a new goroutine.
-func (c *Cron) startJob(j Job) {
+func (c *Cron) startJob(e Entry,now time.Time) {
 	c.jobWaiter.Add(1)
 	go func() {
-		defer c.jobWaiter.Done()
-		j.Run()
+		defer func() {
+			if e.Mode{
+				e.Prev = e.Next
+				e.Next = e.Schedule.Next(now)
+			}
+			c.jobWaiter.Done()
+		}()
+		e.WrappedJob.Run()
 	}()
 }
 
